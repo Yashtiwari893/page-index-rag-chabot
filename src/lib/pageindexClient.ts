@@ -1,6 +1,7 @@
 /**
- * PageIndex AI API Client
- * This client handles document management and RAG-based chat using PageIndex API.
+ * PageIndex AI API client
+ * Implements upload/check/chat/list/delete with robust error handling.
+ * REMOVED: waitUntilReady() - use client-side polling instead to avoid serverless timeout.
  */
 
 const PAGEINDEX_BASE_URL = "https://api.pageindex.ai";
@@ -24,166 +25,167 @@ export type PageIndexChatResponse = {
             content: string;
         };
     }[];
+    [k: string]: any;
 };
 
 export type PageIndexDocument = {
     doc_id: string;
     filename: string;
     created_at: string;
+    [k: string]: any;
 };
 
-/**
- * Upload a document to PageIndex
- *
- * `file` may be a browser `File` object or a Node `Buffer`.
- * This is used by both client upload routines and server-side helpers.
- */
-export async function uploadDocument(file: File | Buffer, filename: string, mode = "mcp"): Promise<string> {
-    if (!PAGEINDEX_API_KEY) throw new Error("PAGEINDEX_API_KEY is not configured");
+function requireKey() {
+    if (!PAGEINDEX_API_KEY) {
+        throw new Error("PAGEINDEX_API_KEY is not configured in environment");
+    }
+}
 
-    const formData = new FormData();
-    const blob = (typeof Buffer !== 'undefined' && Buffer.isBuffer(file))
-        ? new Blob([new Uint8Array(file)])
-        : file as Blob;
-    formData.append("file", blob, filename);
-    formData.append("mode", mode);
+function buildHeaders(extra: Record<string, string> = {}) {
+    return {
+        api_key: PAGEINDEX_API_KEY as string,
+        ...extra,
+    } as Record<string, string>;
+}
 
-    const response = await fetch(`${PAGEINDEX_BASE_URL}/doc/`, {
-        method: "POST",
-        headers: {
-            "api_key": PAGEINDEX_API_KEY,
-        },
-        body: formData,
-    });
+/** Upload a file (Buffer or File) to PageIndex. Returns doc_id string. */
+export async function uploadDocument(file: File | Buffer, filename?: string): Promise<string> {
+    requireKey();
 
-    if (!response.ok) {
-        const error = await response.text();
-        throw new Error(`PageIndex upload failed: ${error}`);
+    const form = new FormData();
+
+    let blob: Blob;
+    if (typeof Buffer !== "undefined" && Buffer.isBuffer(file)) {
+        blob = new Blob([new Uint8Array(file as Buffer)]);
+    } else if (file instanceof Blob) {
+        blob = file as Blob;
+    } else {
+        throw new Error("Unsupported file type for uploadDocument");
     }
 
-    const data = await response.json();
+    form.append("file", blob, filename || "upload.pdf");
+    // PageIndex docs mention a mode field (e.g. mcp)
+    form.append("mode", "mcp");
+
+    const res = await fetch(`${PAGEINDEX_BASE_URL}/doc/`, {
+        method: "POST",
+        headers: buildHeaders(),
+        body: form as unknown as BodyInit,
+    });
+
+    if (!res.ok) {
+        const txt = await res.text().catch(() => "<no body>");
+        throw new Error(`PageIndex upload failed: ${res.status} ${res.statusText} - ${txt}`);
+    }
+
+    const data = await res.json().catch((e) => {
+        throw new Error(`Failed to parse PageIndex upload response: ${String(e)}`);
+    });
+
+    if (!data || !data.doc_id) {
+        throw new Error(`PageIndex upload did not return doc_id: ${JSON.stringify(data)}`);
+    }
+
     return data.doc_id;
 }
 
-/**
- * Check the processing status of a document
- */
+/** Check processing status for a doc_id. Returns { status, retrieval_ready } */
 export async function checkStatus(docId: string): Promise<PageIndexStatusResponse> {
-    if (!PAGEINDEX_API_KEY) throw new Error("PAGEINDEX_API_KEY is not configured");
+    requireKey();
 
-    const response = await fetch(`${PAGEINDEX_BASE_URL}/doc/${docId}/`, {
+    const res = await fetch(`${PAGEINDEX_BASE_URL}/doc/${encodeURIComponent(docId)}/`, {
         method: "GET",
-        headers: {
-            "api_key": PAGEINDEX_API_KEY,
-        },
+        headers: buildHeaders(),
     });
 
-    if (!response.ok) {
-        throw new Error(`PageIndex status check failed: ${response.statusText}`);
+    if (!res.ok) {
+        const txt = await res.text().catch(() => "<no body>");
+        throw new Error(`PageIndex status check failed: ${res.status} ${res.statusText} - ${txt}`);
     }
 
-    return await response.json();
+    const data = await res.json();
+    console.log(`[PageIndex Status] doc_id=${docId}, status=${data.status}, retrieval_ready=${data.retrieval_ready}`);
+    return data;
 }
 
 /**
- * Polling function to wait until a document is ready for retrieval
- */
-export async function waitUntilReady(docId: string, maxWaitMs = 120000, intervalMs = 3000): Promise<void> {
-    const startTime = Date.now();
-
-    while (Date.now() - startTime < maxWaitMs) {
-        const { status, retrieval_ready } = await checkStatus(docId);
-
-        if (status === "completed" && retrieval_ready) {
-            console.log(`Document ${docId} is ready.`);
-            return;
-        }
-
-        if (status === "failed") {
-            throw new Error(`Document processing failed for ${docId}`);
-        }
-
-        console.log(`Document ${docId} still processing (status: ${status}). Waiting...`);
-        await new Promise(resolve => setTimeout(resolve, intervalMs));
-    }
-
-    throw new Error(`Timeout waiting for document ${docId} to be ready`);
-}
-
-/**
- * Perform RAG-based chat with one or more documents
+ * Chat with documents using PageIndex API.
+ * @param docIds - single doc_id string or array of doc_ids
+ * @param messages - array of messages
+ * @param opts - options including systemPrompt, stream, enableCitations
  */
 export async function chatWithDocs(
-    docIds: string[] | string,
+    docIds: string | string[],
     messages: PageIndexMessage[],
-    systemPrompt?: string
-): Promise<string> {
-    if (!PAGEINDEX_API_KEY) throw new Error("PAGEINDEX_API_KEY is not configured");
-    const ids = Array.isArray(docIds) ? docIds : [docIds];
-    if (ids.length === 0) throw new Error("No doc_ids provided for chat");
+    opts?: { systemPrompt?: string; stream?: boolean; enableCitations?: boolean }
+): Promise<string | Response> {
+    requireKey();
 
-    const chatMessages = [...messages];
-    if (systemPrompt) {
-        chatMessages.unshift({ role: "system", content: systemPrompt });
+    const payload: any = {
+        doc_id: Array.isArray(docIds) ? (docIds.length === 1 ? docIds[0] : docIds) : docIds,
+        messages: messages,
+        stream: !!opts?.stream,
+        enable_citations: opts?.enableCitations ?? true,
+    };
+
+    if (opts?.systemPrompt) {
+        // Prepend system prompt as the first message
+        payload.messages = [{ role: "system", content: opts.systemPrompt }, ...messages];
     }
 
-    const response = await fetch(`${PAGEINDEX_BASE_URL}/chat/completions`, {
+    const res = await fetch(`${PAGEINDEX_BASE_URL}/chat/completions`, {
         method: "POST",
-        headers: {
-            "api_key": PAGEINDEX_API_KEY,
-            "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-            doc_id: ids.length === 1 ? ids[0] : ids,
-            messages: chatMessages,
-            stream: false,
-            enable_citations: true,
-        }),
+        headers: buildHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify(payload),
     });
 
-    if (!response.ok) {
-        const error = await response.text();
-        throw new Error(`PageIndex chat failed: ${error}`);
+    if (!res.ok) {
+        const txt = await res.text().catch(() => "<no body>");
+        throw new Error(`PageIndex chat failed: ${res.status} ${res.statusText} - ${txt}`);
     }
 
-    const data: PageIndexChatResponse = await response.json();
+    if (opts?.stream) {
+        // Return raw response so caller can stream body
+        return res;
+    }
+
+    const data = (await res.json()) as PageIndexChatResponse;
+    if (!data || !data.choices || data.choices.length === 0) {
+        throw new Error(`PageIndex chat returned no choices: ${JSON.stringify(data)}`);
+    }
+
     return data.choices[0].message.content;
 }
 
-/**
- * List all documents in PageIndex
- */
+/** List documents. */
 export async function listDocuments(limit = 50, offset = 0): Promise<PageIndexDocument[]> {
-    if (!PAGEINDEX_API_KEY) throw new Error("PAGEINDEX_API_KEY is not configured");
+    requireKey();
 
-    const response = await fetch(`${PAGEINDEX_BASE_URL}/docs?limit=${limit}&offset=${offset}`, {
+    const res = await fetch(`${PAGEINDEX_BASE_URL}/docs?limit=${limit}&offset=${offset}`, {
         method: "GET",
-        headers: {
-            "api_key": PAGEINDEX_API_KEY,
-        },
+        headers: buildHeaders(),
     });
 
-    if (!response.ok) {
-        throw new Error(`PageIndex list docs failed: ${response.statusText}`);
+    if (!res.ok) {
+        const txt = await res.text().catch(() => "<no body>");
+        throw new Error(`PageIndex list docs failed: ${res.status} ${res.statusText} - ${txt}`);
     }
 
-    return await response.json();
+    return await res.json();
 }
 
-/**
- * Delete a document from PageIndex
- */
+/** Delete a document by doc_id. */
 export async function deleteDocument(docId: string): Promise<void> {
-    if (!PAGEINDEX_API_KEY) throw new Error("PAGEINDEX_API_KEY is not configured");
+    requireKey();
 
-    const response = await fetch(`${PAGEINDEX_BASE_URL}/doc/${docId}/`, {
+    const res = await fetch(`${PAGEINDEX_BASE_URL}/doc/${encodeURIComponent(docId)}/`, {
         method: "DELETE",
-        headers: {
-            "api_key": PAGEINDEX_API_KEY,
-        },
+        headers: buildHeaders(),
     });
 
-    if (!response.ok) {
-        throw new Error(`PageIndex delete failed: ${response.statusText}`);
+    if (!res.ok) {
+        const txt = await res.text().catch(() => "<no body>");
+        throw new Error(`PageIndex delete failed: ${res.status} ${res.statusText} - ${txt}`);
     }
 }
+

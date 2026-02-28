@@ -11,25 +11,47 @@ type FileRow = {
 };
 
 export async function GET() {
-    const { data, error } = await supabase
-        .from("rag_files")
-        .select("id, name, doc_id, created_at")
-        .order("created_at", { ascending: false });
+    try {
+        // 1) PageIndex documents (phone_documents table)
+        const { data: piDocs, error: piError } = await supabase
+            .from("phone_documents")
+            .select("doc_id, filename, uploaded_at, phone_number")
+            .order("uploaded_at", { ascending: false });
 
-    if (error) {
-        console.error("FILES_API_ERROR:", error.message);
-        return NextResponse.json({ error: error.message }, { status: 500 });
+        if (piError) throw piError;
+
+        const pageIndexFiles = (piDocs || []).map((d: any) => ({
+            id: d.doc_id,
+            name: d.filename,
+            created_at: d.uploaded_at,
+            file_type: "pageindex",
+            phone_number: d.phone_number,
+        }));
+
+        // 2) Legacy rag_files
+        const { data: legacyFiles, error: legacyError } = await supabase
+            .from("rag_files")
+            .select("id, name, created_at, doc_id")
+            .order("created_at", { ascending: false });
+
+        if (legacyError) throw legacyError;
+
+        const legacy = (legacyFiles || []).map((f: any) => ({
+            id: f.doc_id || f.id,
+            db_id: f.id,
+            name: f.name,
+            created_at: f.created_at,
+            file_type: f.doc_id ? "pageindex" : "legacy",
+        }));
+
+        const files = [...pageIndexFiles, ...legacy];
+
+        return NextResponse.json({ files });
+    } catch (err: unknown) {
+        console.error("FILES_API_ERROR:", err);
+        const message = err instanceof Error ? err.message : "Unknown error";
+        return NextResponse.json({ error: message }, { status: 500 });
     }
-
-    const files = (data as any[] | null)?.map((file) => ({
-        id: file.id,
-        doc_id: file.doc_id,
-        name: file.name,
-        created_at: file.created_at,
-        chunk_count: 0, // not used on chat page
-    })) ?? [];
-
-    return NextResponse.json({ files });
 }
 
 export async function DELETE(req: Request) {

@@ -20,19 +20,18 @@ export async function generateAutoResponse(
     messageId: string
 ): Promise<AutoResponseResult> {
     try {
-        // 1. Get the phone configuration row (includes array of doc_ids)
-        const { data: mappingRows, error: mappingError } = await supabase
-            .from("phone_document_mapping")
-            .select("doc_ids, system_prompt, auth_token, origin")
-            .eq("phone_number", toNumber)
-            .single();
+        // 1. Get all PageIndex doc_ids mapped to this business number
+        const { data: docRows, error: docError } = await supabase
+            .from("phone_documents")
+            .select("doc_id")
+            .eq("phone_number", toNumber);
 
-        if (mappingError) {
-            console.error("Error fetching phone mapping:", mappingError);
-            return { success: false, error: "Failed to fetch phone configuration" };
+        if (docError) {
+            console.error("Error fetching phone documents:", docError);
+            return { success: false, error: "Failed to fetch document mappings" };
         }
 
-        const docIds: string[] = mappingRows?.doc_ids || [];
+        const docIds = docRows?.map(row => row.doc_id) || [];
 
         if (docIds.length === 0) {
             console.log(`No documents found in PageIndex for business number: ${toNumber}`);
@@ -43,10 +42,23 @@ export async function generateAutoResponse(
             };
         }
 
-        // 2. extract credentials & prompt from mapping row
-        const customSystemPrompt = mappingRows.system_prompt;
-        const auth_token = mappingRows.auth_token;
-        const origin = mappingRows.origin;
+        // 2. Fetch phone mapping details (system prompt and credentials)
+        const { data: phoneMappings, error: mappingError } = await supabase
+            .from("phone_document_mapping")
+            .select("system_prompt, auth_token, origin")
+            .eq("phone_number", toNumber);
+
+        if (mappingError || !phoneMappings || phoneMappings.length === 0) {
+            console.error("Error fetching phone mapping details:", mappingError);
+            return {
+                success: false,
+                error: "Failed to fetch phone configuration",
+            };
+        }
+
+        const customSystemPrompt = phoneMappings[0].system_prompt;
+        const auth_token = phoneMappings[0].auth_token;
+        const origin = phoneMappings[0].origin;
 
         if (!auth_token || !origin) {
             return {
@@ -83,11 +95,13 @@ export async function generateAutoResponse(
 
         console.log(`Calling PageIndex chat for ${toNumber} with ${docIds.length} docs...`);
 
-        const response = await chatWithDocs(
+        const responseResult = await chatWithDocs(
             docIds,
             [...history, { role: "user", content: messageText }],
-            finalSystemPrompt
+            { systemPrompt: finalSystemPrompt, stream: false, enableCitations: true }
         );
+
+        const response = typeof responseResult === "string" ? responseResult : undefined;
 
         if (!response) {
             return { success: false, error: "Empty response from AI" };

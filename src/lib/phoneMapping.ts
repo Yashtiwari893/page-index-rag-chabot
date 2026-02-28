@@ -6,32 +6,30 @@ import { supabase } from "./supabaseClient";
 export async function getFilesForPhoneNumber(phoneNumber: string): Promise<string[]> {
     const { data, error } = await supabase
         .from("phone_document_mapping")
-        .select("doc_ids")
-        .eq("phone_number", phoneNumber)
-        .single();
+        .select("file_id")
+        .eq("phone_number", phoneNumber);
 
     if (error) {
         console.error("Error fetching files for phone number:", error);
         return [];
     }
 
-    return data?.doc_ids || [];
+    return data?.map(row => row.file_id) || [];
 }
 
 /**
  * Check if a phone number has any document mappings
  */
 export async function hasDocumentMapping(phoneNumber: string): Promise<boolean> {
-    const { data, error } = await supabase
+    const { count, error } = await supabase
         .from("phone_document_mapping")
-        .select("doc_ids")
-        .eq("phone_number", phoneNumber)
-        .single();
+        .select("*", { count: "exact", head: true })
+        .eq("phone_number", phoneNumber);
 
     if (error) {
         console.error("Error checking document mapping:", error);
         return false;
     }
 
-    return Array.isArray(data?.doc_ids) && data.doc_ids.length > 0;
+    return (count || 0) > 0;
 }

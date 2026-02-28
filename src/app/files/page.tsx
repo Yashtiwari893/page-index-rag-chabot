@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { FileUpload } from "@/components/ui/file-upload";
 import { Switch } from "@/components/ui/switch";
@@ -20,6 +20,13 @@ type PhoneNumberGroup = {
     files: FileItem[];
     auth_token: string;
     origin: string;
+};
+
+type UploadingFile = {
+    name: string;
+    docId: string;
+    status: "uploading" | "processing" | "completed" | "error";
+    error?: string;
 };
 
 export default function FilesPage() {
@@ -45,11 +52,9 @@ export default function FilesPage() {
     const [processingMode, setProcessingMode] = useState<"ocr" | "transcribe">("transcribe");
     const [devInfo, setDevInfo] = useState<{ extractedText?: string, chunks?: number, mode?: string } | null>(null);
 
-    // Website processing state
-    const [websiteUrl, setWebsiteUrl] = useState("");
-    const [processingUrl, setProcessingUrl] = useState(false);
-    const [urlStep, setUrlStep] = useState<string | null>(null);
-    const [urlResult, setUrlResult] = useState<{ doc_id: string } | null>(null);
+    // Polling state
+    const [uploadingFileStatus, setUploadingFileStatus] = useState<UploadingFile | null>(null);
+    const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
     const loadPhoneGroups = useCallback(async () => {
         const res = await fetch("/api/phone-groups");
@@ -62,6 +67,15 @@ export default function FilesPage() {
     useEffect(() => {
         void loadPhoneGroups();
     }, [loadPhoneGroups]);
+
+    // Cleanup polling interval on unmount
+    useEffect(() => {
+        return () => {
+            if (pollingIntervalRef.current) {
+                clearInterval(pollingIntervalRef.current);
+            }
+        };
+    }, []);
 
     // When a phone number is selected, populate the edit form
     useEffect(() => {
@@ -136,48 +150,6 @@ export default function FilesPage() {
         }
     }
 
-    async function handleUrlSubmit() {
-        if (!websiteUrl.trim()) {
-            alert("Please enter a website URL");
-            return;
-        }
-        if (!editPhoneNumber.trim()) {
-            alert("Please provide a phone number before mapping (optional)");
-            // allow proceed without mapping
-        }
-
-        setProcessingUrl(true);
-        setUrlStep("Crawling website...");
-        setUrlResult(null);
-
-        try {
-            const res = await fetch("/api/process-url", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    url: websiteUrl.trim(),
-                    phoneNumber: editPhoneNumber.trim() || undefined,
-                }),
-            });
-            const data = await res.json();
-
-            if (!res.ok) {
-                throw new Error(data.error || "Failed to process website");
-            }
-
-            setUrlResult({ doc_id: data.doc_id });
-            alert(`Website processed successfully (doc_id: ${data.doc_id})`);
-            // refresh phone groups in case mapping changed
-            await loadPhoneGroups();
-        } catch (err) {
-            console.error("Website processing error:", err);
-            alert(err instanceof Error ? err.message : "Error processing website");
-        } finally {
-            setProcessingUrl(false);
-            setUrlStep(null);
-        }
-    }
-
     async function handleUpload() {
         if (!selectedFile) {
             alert("Please select a file first");
@@ -208,27 +180,101 @@ export default function FilesPage() {
 
         setUploading(true);
         try {
-            const res = await fetch("/api/upload-pageindex", { method: "POST", body: form });
+            // STEP 1: Upload file to PageIndex
+            const res = await fetch("/api/process-file", { method: "POST", body: form });
             const payload = await res.json();
 
             if (!res.ok) {
                 console.error("Upload failed:", payload?.error);
-                alert(payload?.error ?? "Failed to upload file");
+                alert(payload?.error ?? "Failed to process file");
+                setUploading(false);
                 return;
             }
 
-            alert(`Success! Document uploaded to PageIndex (doc_id: ${payload.doc_id})`);
+            const docId = payload.doc_id;
+            console.log(`[Frontend] File uploaded successfully, doc_id=${docId}`);
 
-            // Reset file selection
-            setSelectedFile(null);
+            // STEP 2: Show "Processing..." and start polling
+            setUploadingFileStatus({
+                name: selectedFile.name,
+                docId: docId,
+                status: "processing",
+            });
 
-            await loadPhoneGroups();
+            // STEP 3: Poll /api/upload-pageindex/status?doc_id=xxx every 3 seconds
+            const maxPollTime = 5 * 60 * 1000; // 5 minutes max
+            const pollInterval = 3000; // 3 seconds
+            const startTime = Date.now();
+            let pollCount = 0;
 
-            // select phone number again
-            setSelectedPhoneNumber(editPhoneNumber.trim());
-            setIsNewPhone(false);
+            const pollStatus = async () => {
+                try {
+                    const statusRes = await fetch(`/api/upload-pageindex?doc_id=${docId}`);
+                    const statusData = await statusRes.json();
+
+                    pollCount++;
+                    console.log(`[Frontend] Poll #${pollCount}: retrieval_ready=${statusData.retrieval_ready}`);
+
+                    // If processing is complete, update UI and stop polling
+                    if (statusData.retrieval_ready) {
+                        console.log(`[Frontend] ✅ Processing complete!`);
+                        setUploadingFileStatus({
+                            name: selectedFile.name,
+                            docId: docId,
+                            status: "completed",
+                        });
+
+                        if (pollingIntervalRef.current) {
+                            clearInterval(pollingIntervalRef.current);
+                            pollingIntervalRef.current = null;
+                        }
+
+                        setUploading(false);
+                        setSelectedFile(null);
+
+                        // Reload phone groups to show the new file
+                        await loadPhoneGroups();
+
+                        // Select the phone number that was just uploaded to
+                        setSelectedPhoneNumber(editPhoneNumber.trim());
+                        setIsNewPhone(false);
+
+                        // Clear the "Processing..." message after 3 seconds
+                        setTimeout(() => {
+                            setUploadingFileStatus(null);
+                        }, 3000);
+
+                        return;
+                    }
+
+                    // Check for timeout (5 minutes)
+                    if (Date.now() - startTime > maxPollTime) {
+                        throw new Error("Processing timeout - took longer than 5 minutes");
+                    }
+                } catch (error) {
+                    console.error("[Frontend] Polling error:", error);
+                    setUploadingFileStatus({
+                        name: selectedFile.name,
+                        docId: docId,
+                        status: "error",
+                        error: error instanceof Error ? error.message : "Polling error",
+                    });
+
+                    if (pollingIntervalRef.current) {
+                        clearInterval(pollingIntervalRef.current);
+                        pollingIntervalRef.current = null;
+                    }
+                    setUploading(false);
+                }
+            };
+
+            // Start polling
+            pollingIntervalRef.current = setInterval(pollStatus, pollInterval);
+            // Also do first poll immediately
+            await pollStatus();
+
         } finally {
-            setUploading(false);
+            // Note: don't call setUploading(false) here because polling might still be in progress
         }
     }
 
@@ -491,11 +537,11 @@ export default function FilesPage() {
                                         </p>
                                         <div className="flex items-center gap-2 bg-white p-2 rounded border border-blue-300">
                                             <code className="text-xs font-mono text-blue-900 flex-1">
-                                                https://page-index-rag-chabot.vercel.app/api/webhook/whatsapp
+                                                https://rag-chatbot-ochre.vercel.app/api/webhook/whatsapp
                                             </code>
                                             <button
                                                 onClick={() => {
-                                                    navigator.clipboard.writeText("https://page-index-rag-chabot.vercel.app/api/webhook/whatsapp");
+                                                    navigator.clipboard.writeText("https://rag-chatbot-ochre.vercel.app/api/webhook/whatsapp");
                                                     alert("Webhook URL copied to clipboard!");
                                                 }}
                                                 className="px-2 py-1 text-xs bg-blue-600 text-white rounded hover:bg-blue-700"
@@ -505,41 +551,7 @@ export default function FilesPage() {
                                         </div>
                                     </div>
 
-                                    {/* Website URL Section */}
-                                    <div className="border rounded-lg p-6 bg-white mb-6">
-                                        <h3 className="text-lg font-semibold mb-4">Process Website URL</h3>
-
-                                        <div className="space-y-4">
-                                            <div>
-                                                <label className="block text-sm font-medium mb-2">
-                                                    Website URL
-                                                </label>
-                                                <input
-                                                    type="text"
-                                                    value={websiteUrl}
-                                                    onChange={(e) => setWebsiteUrl(e.target.value)}
-                                                    placeholder="https://example.com"
-                                                    className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
-                                                />
-                                            </div>
-
-                                            <button
-                                                onClick={handleUrlSubmit}
-                                                disabled={processingUrl || !websiteUrl.trim()}
-                                                className="w-full px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700 disabled:bg-gray-300 disabled:cursor-not-allowed font-medium"
-                                            >
-                                                {processingUrl ? urlStep || "Processing..." : "Process Website"}
-                                            </button>
-
-                                            {urlResult && (
-                                                <p className="text-sm text-green-700">
-                                                    Processed doc_id: {urlResult.doc_id}
-                                                </p>
-                                            )}
-                                        </div>
-                                    </div>
-
-                                {/* File Upload Section */}
+                                    {/* File Upload Section */}
                                     <div className="border rounded-lg p-6 bg-white">
                                         <div className="flex justify-between items-center mb-4">
                                             <h3 className="text-lg font-semibold">Upload New File</h3>
@@ -592,8 +604,45 @@ export default function FilesPage() {
                                                 disabled={uploading || !selectedFile || !editPhoneNumber.trim() || !editAuthToken.trim() || !editOrigin.trim()}
                                                 className="w-full px-4 py-3 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed font-medium"
                                             >
-                                                {uploading ? "Processing..." : "Upload & Process File"}
+                                                {uploading ? "Uploading..." : "Upload & Process File"}
                                             </button>
+
+                                            {/* Upload Status Indicator */}
+                                            {uploadingFileStatus && (
+                                                <div className={`p-3 rounded-md text-sm font-medium flex items-center gap-2 ${
+                                                    uploadingFileStatus.status === "processing"
+                                                        ? "bg-blue-100 text-blue-800"
+                                                        : uploadingFileStatus.status === "completed"
+                                                        ? "bg-green-100 text-green-800"
+                                                        : "bg-red-100 text-red-800"
+                                                }`}>
+                                                    {uploadingFileStatus.status === "processing" && (
+                                                        <>
+                                                            <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+                                                                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                                                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                                                            </svg>
+                                                            Processing "{uploadingFileStatus.name}"...
+                                                        </>
+                                                    )}
+                                                    {uploadingFileStatus.status === "completed" && (
+                                                        <>
+                                                            <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
+                                                                <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd"></path>
+                                                            </svg>
+                                                            ✅ Ready! "{uploadingFileStatus.name}"
+                                                        </>
+                                                    )}
+                                                    {uploadingFileStatus.status === "error" && (
+                                                        <>
+                                                            <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
+                                                                <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd"></path>
+                                                            </svg>
+                                                            {uploadingFileStatus.error}
+                                                        </>
+                                                    )}
+                                                </div>
+                                            )}
 
                                             {(!editAuthToken.trim() || !editOrigin.trim()) && !isNewPhone && (
                                                 <p className="text-xs text-amber-600 text-center">

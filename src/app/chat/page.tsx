@@ -13,8 +13,7 @@ type ChatMessage = {
 };
 
 type FileItem = {
-    id: string;          // internal database id
-    doc_id?: string;     // PageIndex document id (primary value we send)
+    id: string;
     name: string;
 };
 
@@ -41,17 +40,17 @@ export default function ChatPage() {
             setFiles(fetchedFiles);
 
             const hadSelection = Boolean(selectedFile);
-            let nextSelection: string | null = selectedFile;
+            let nextSelection = selectedFile;
 
             if (
                 nextSelection &&
-                !fetchedFiles.some((f) => f.doc_id === nextSelection)
+                !fetchedFiles.some((f) => f.id === nextSelection)
             ) {
                 nextSelection = null;
             }
 
             if (!hadSelection && !nextSelection && fetchedFiles.length > 0) {
-                nextSelection = fetchedFiles[0].doc_id || null;
+                nextSelection = fetchedFiles[0].id;
             }
 
             if (nextSelection !== selectedFile) {
@@ -135,7 +134,7 @@ export default function ChatPage() {
                 body: JSON.stringify({
                     session_id: sessionId,
                     message: content,
-                    doc_id: selectedFile,  // send PageIndex doc id
+                    file_id: selectedFile,  // <-- important
                 }),
             });
 
@@ -241,7 +240,7 @@ export default function ChatPage() {
                     onChange={(e) => setSelectedFile(e.target.value)}
                 >
                     {files.map((f: FileItem) => (
-                        <option key={f.id} value={f.doc_id || f.id}>
+                        <option key={f.id} value={f.id}>
                             {f.name}
                         </option>
                     ))}

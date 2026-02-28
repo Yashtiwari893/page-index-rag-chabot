@@ -1,10 +1,11 @@
 import { NextResponse } from "next/server";
-import { uploadDocument, waitUntilReady } from "@/lib/pageindexClient";
+import { uploadDocument } from "@/lib/pageindexClient";
 import { supabase } from "@/lib/supabaseClient";
 
 export const runtime = "nodejs";
 
 export async function POST(req: Request) {
+    let docId: string | null = null;
     try {
         const form = await req.formData();
         const file = form.get("file") as File | null;
@@ -30,33 +31,28 @@ export async function POST(req: Request) {
         const buffer = await file.arrayBuffer();
         const fileName = file.name;
 
-        console.log(`Uploading ${fileName} to PageIndex for ${phoneNumber}...`);
+        console.log(`[ProcessFile] Uploading ${fileName} to PageIndex for ${phoneNumber}...`);
 
-        // 1) Upload to PageIndex
-        const docId = await uploadDocument(Buffer.from(buffer), fileName);
-        console.log(`File uploaded to PageIndex. doc_id: ${docId}`);
+        // 1) Upload to PageIndex - RETURNS IMMEDIATELY
+        const uploadedDocId = await uploadDocument(Buffer.from(buffer), fileName);
+        docId = uploadedDocId;
+        console.log(`[ProcessFile] File uploaded to PageIndex. doc_id: ${uploadedDocId}`);
 
-        // 2) Wait until retrieval is ready (polling)
-        console.log("Waiting for PageIndex to process the document...");
-        await waitUntilReady(docId);
-        console.log("PageIndex processing complete.");
-
-        // 3) Store in the new phone_documents table
+        // 2) Store in the new phone_documents table - NO WAITING FOR PROCESSING
         const { error: dbError } = await supabase
             .from("phone_documents")
             .insert({
                 phone_number: phoneNumber,
-                doc_id: docId,
+                doc_id: uploadedDocId,
                 filename: fileName,
             });
 
         if (dbError) {
-            console.error("Supabase phone_documents error:", dbError);
+            console.error("[ProcessFile] Supabase phone_documents error:", dbError);
             throw dbError;
         }
 
-        // 4) Update or create metadata in phone_document_mapping (for system_prompt and intent)
-        // This ensures the dashboard and credentials still work
+        // 3) Update or create metadata in phone_document_mapping
         const { data: existingMapping } = await supabase
             .from("phone_document_mapping")
             .select("*")
@@ -85,15 +81,25 @@ export async function POST(req: Request) {
                 });
         }
 
+        console.log(`[ProcessFile] ✅ Saved to Supabase. Frontend will poll /api/upload-pageindex/status?doc_id=${uploadedDocId}`);
+
+        // 4) RETURN IMMEDIATELY - DO NOT WAIT FOR PAGEINDEX PROCESSING
+        // Frontend should poll /api/upload-pageindex/status?doc_id={docId} to check when ready
         return NextResponse.json({
-            message: "File processed and indexed by PageIndex successfully",
-            doc_id: docId,
+            message: "File uploaded to PageIndex. Check status via polling endpoint.",
+            doc_id: uploadedDocId,
             filename: fileName,
             phone_number: phoneNumber,
+            status: "processing",
+            status_endpoint: `/api/upload-pageindex/status?doc_id=${uploadedDocId}`,
         });
 
     } catch (err: unknown) {
         console.error("PROCESS_FILE_ERROR:", err);
+        // Cleanup on failure
+        if (docId) {
+            void supabase.from("phone_documents").delete().eq("doc_id", docId);
+        }
         const message = err instanceof Error ? err.message : "Unknown error";
         return NextResponse.json({ error: message }, { status: 500 });
     }
