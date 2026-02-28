@@ -45,6 +45,12 @@ export default function FilesPage() {
     const [processingMode, setProcessingMode] = useState<"ocr" | "transcribe">("transcribe");
     const [devInfo, setDevInfo] = useState<{ extractedText?: string, chunks?: number, mode?: string } | null>(null);
 
+    // Website processing state
+    const [websiteUrl, setWebsiteUrl] = useState("");
+    const [processingUrl, setProcessingUrl] = useState(false);
+    const [urlStep, setUrlStep] = useState<string | null>(null);
+    const [urlResult, setUrlResult] = useState<{ doc_id: string } | null>(null);
+
     const loadPhoneGroups = useCallback(async () => {
         const res = await fetch("/api/phone-groups");
         const data = await res.json();
@@ -127,6 +133,48 @@ export default function FilesPage() {
             alert(err instanceof Error ? err.message : "Failed to generate system prompt");
         } finally {
             setGeneratingPrompt(false);
+        }
+    }
+
+    async function handleUrlSubmit() {
+        if (!websiteUrl.trim()) {
+            alert("Please enter a website URL");
+            return;
+        }
+        if (!editPhoneNumber.trim()) {
+            alert("Please provide a phone number before mapping (optional)");
+            // allow proceed without mapping
+        }
+
+        setProcessingUrl(true);
+        setUrlStep("Crawling website...");
+        setUrlResult(null);
+
+        try {
+            const res = await fetch("/api/process-url", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    url: websiteUrl.trim(),
+                    phoneNumber: editPhoneNumber.trim() || undefined,
+                }),
+            });
+            const data = await res.json();
+
+            if (!res.ok) {
+                throw new Error(data.error || "Failed to process website");
+            }
+
+            setUrlResult({ doc_id: data.doc_id });
+            alert(`Website processed successfully (doc_id: ${data.doc_id})`);
+            // refresh phone groups in case mapping changed
+            await loadPhoneGroups();
+        } catch (err) {
+            console.error("Website processing error:", err);
+            alert(err instanceof Error ? err.message : "Error processing website");
+        } finally {
+            setProcessingUrl(false);
+            setUrlStep(null);
         }
     }
 
@@ -457,7 +505,41 @@ export default function FilesPage() {
                                         </div>
                                     </div>
 
-                                    {/* File Upload Section */}
+                                    {/* Website URL Section */}
+                                    <div className="border rounded-lg p-6 bg-white mb-6">
+                                        <h3 className="text-lg font-semibold mb-4">Process Website URL</h3>
+
+                                        <div className="space-y-4">
+                                            <div>
+                                                <label className="block text-sm font-medium mb-2">
+                                                    Website URL
+                                                </label>
+                                                <input
+                                                    type="text"
+                                                    value={websiteUrl}
+                                                    onChange={(e) => setWebsiteUrl(e.target.value)}
+                                                    placeholder="https://example.com"
+                                                    className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
+                                                />
+                                            </div>
+
+                                            <button
+                                                onClick={handleUrlSubmit}
+                                                disabled={processingUrl || !websiteUrl.trim()}
+                                                className="w-full px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700 disabled:bg-gray-300 disabled:cursor-not-allowed font-medium"
+                                            >
+                                                {processingUrl ? urlStep || "Processing..." : "Process Website"}
+                                            </button>
+
+                                            {urlResult && (
+                                                <p className="text-sm text-green-700">
+                                                    Processed doc_id: {urlResult.doc_id}
+                                                </p>
+                                            )}
+                                        </div>
+                                    </div>
+
+                                {/* File Upload Section */}
                                     <div className="border rounded-lg p-6 bg-white">
                                         <div className="flex justify-between items-center mb-4">
                                             <h3 className="text-lg font-semibold">Upload New File</h3>

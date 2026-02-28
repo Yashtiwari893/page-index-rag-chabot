@@ -34,6 +34,9 @@ export type PageIndexDocument = {
 
 /**
  * Upload a document to PageIndex
+ *
+ * `file` may be a browser `File` object or a Node `Buffer`.
+ * This is used by both client upload routines and server-side helpers.
  */
 export async function uploadDocument(file: File | Buffer, filename: string, mode = "mcp"): Promise<string> {
     if (!PAGEINDEX_API_KEY) throw new Error("PAGEINDEX_API_KEY is not configured");
